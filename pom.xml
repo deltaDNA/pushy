@@ -137,6 +137,17 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
             <!-- Download the alpn-boot.jar in advance to add it to the boot classpath. -->
             <plugin>
                 <artifactId>maven-dependency-plugin</artifactId>
@@ -195,7 +206,7 @@
                 <jdk>[1.8,)</jdk>
             </activation>
             <properties>
-                <jetty.alpn.version>8.1.6.v20151105</jetty.alpn.version>
+                <jetty.alpn.version>8.1.7.v20160121</jetty.alpn.version>
             </properties>
         </profile>
         <profile>
@@ -316,6 +327,18 @@
             </activation>
             <properties>
                 <jetty.alpn.version>8.1.6.v20151105</jetty.alpn.version>
+            </properties>
+        </profile>
+        <profile>
+            <id>alpn-8u71</id>
+            <activation>
+                <property>
+                    <name>java.version</name>
+                    <value>1.8.0_71</value>
+                </property>
+            </activation>
+            <properties>
+                <jetty.alpn.version>8.1.7.v20160121</jetty.alpn.version>
             </properties>
         </profile>
     </profiles>
