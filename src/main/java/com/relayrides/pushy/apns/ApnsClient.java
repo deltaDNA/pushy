@@ -36,9 +36,14 @@ import java.security.cert.X509Certificate;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.net.ssl.SSLException;
 
+import io.netty.channel.Channel;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.oio.OioEventLoopGroup;
+import io.netty.channel.socket.oio.OioSocketChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -66,6 +71,8 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
+import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.handler.timeout.WriteTimeoutHandler;
 import io.netty.util.concurrent.DefaultPromise;
 import io.netty.util.concurrent.FailedFuture;
 import io.netty.util.concurrent.Future;
@@ -86,7 +93,7 @@ import io.netty.util.concurrent.SucceededFuture;
  *
  * <p>To construct a client, callers will need to provide the certificate provisioned by Apple and its accompanying
  * private key. The certificate and key will be used to authenticate the client and identify the topics to which it can
- * send notifications. Callers may optionally specify an {@link NioEventLoopGroup} when constructing a new client. If no
+ * send notifications. Callers may optionally specify an {@link EventLoopGroup} when constructing a new client. If no
  * event loop group is specified, clients will create and manage their own single-thread event loop group. If many
  * clients are operating in parallel, specifying a shared event loop group serves as a mechanism to keep the total
  * number of threads in check.</p>
@@ -117,13 +124,18 @@ import io.netty.util.concurrent.SucceededFuture;
  * @author <a href="https://github.com/jchambers">Jon Chambers</a>
  *
  * @param <T> the type of notification handled by the client
+ *
+ * @since 0.5
  */
 public class ApnsClient<T extends ApnsPushNotification> {
+    private static final String EPOLL_EVENT_LOOP_GROUP_CLASS = "io.netty.channel.epoll.EpollEventLoopGroup";
+    private static final String EPOLL_SOCKET_CHANNEL_CLASS = "io.netty.channel.epoll.EpollSocketChannel";
 
     private final Bootstrap bootstrap;
     private volatile ProxyHandlerFactory proxyHandlerFactory;
     private final boolean shouldShutDownEventLoopGroup;
 
+    private long writeTimeoutMillis = DEFAULT_WRITE_TIMEOUT_MILLIS;
     private Long gracefulShutdownTimeoutMillis;
 
     private volatile ChannelPromise connectionReadyPromise;
@@ -131,6 +143,14 @@ public class ApnsClient<T extends ApnsPushNotification> {
     private long reconnectDelay = INITIAL_RECONNECT_DELAY;
 
     private final Map<T, Promise<PushNotificationResponse<T>>> responsePromises = new IdentityHashMap<>();
+
+    private ApnsClientMetricsListener metricsListener = new NoopMetricsListener();
+    private final AtomicLong nextNotificationId = new AtomicLong(0);
+
+    /**
+     * The default write timeout, in milliseconds.
+     */
+    public static final long DEFAULT_WRITE_TIMEOUT_MILLIS = 20_000;
 
     /**
      * The hostname for the production APNs gateway.
@@ -162,6 +182,7 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
     private static final long INITIAL_RECONNECT_DELAY = 1; // second
     private static final long MAX_RECONNECT_DELAY = 60; // seconds
+    static final int PING_IDLE_TIME = 60; // seconds
 
     private static final Logger log = LoggerFactory.getLogger(ApnsClient.class);
 
@@ -181,6 +202,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * when constructing the context
      * @throws FileNotFoundException if the given PKCS#12 file could not be found
      * @throws IOException if any IO problem occurs while attempting to read the given PKCS#12 file
+     *
+     * @since 0.5
      */
     public ApnsClient(final File p12File, final String password) throws SSLException, FileNotFoundException, IOException {
         this(p12File, password, null);
@@ -204,8 +227,10 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * when constructing the context
      * @throws FileNotFoundException if the given PKCS#12 file could not be found
      * @throws IOException if any IO problem occurs while attempting to read the given PKCS#12 file
+     *
+     * @since 0.5
      */
-    public ApnsClient(final File p12File, final String password, final NioEventLoopGroup eventLoopGroup) throws SSLException, FileNotFoundException, IOException {
+    public ApnsClient(final File p12File, final String password, final EventLoopGroup eventLoopGroup) throws SSLException, FileNotFoundException, IOException {
         this(ApnsClient.getSslContextWithP12File(p12File, password), eventLoopGroup);
     }
 
@@ -224,6 +249,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @throws SSLException if the given PKCS#12 data could not be loaded or if any other SSL-related problem arises
      * when constructing the context
+     *
+     * @since 0.5.2
      */
     public ApnsClient(final InputStream p12InputStream, final String password) throws SSLException {
         this(p12InputStream, password, null);
@@ -246,8 +273,10 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @throws SSLException if the given PKCS#12 data could not be loaded or if any other SSL-related problem arises
      * when constructing the context
+     *
+     * @since 0.5.2
      */
-    public ApnsClient(final InputStream p12InputStream, final String password, final NioEventLoopGroup eventLoopGroup) throws SSLException {
+    public ApnsClient(final InputStream p12InputStream, final String password, final EventLoopGroup eventLoopGroup) throws SSLException {
         this(ApnsClient.getSslContextWithP12InputStream(p12InputStream, password), eventLoopGroup);
     }
 
@@ -266,6 +295,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @throws SSLException if the given key or certificate could not be loaded or if any other SSL-related problem
      * arises when constructing the context
+     *
+     * @since 0.5
      */
     public ApnsClient(final X509Certificate certificate, final PrivateKey privateKey, final String privateKeyPassword) throws SSLException {
         this(certificate, privateKey, privateKeyPassword, null);
@@ -288,8 +319,10 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @throws SSLException if the given key or certificate could not be loaded or if any other SSL-related problem
      * arises when constructing the context
+     *
+     * @since 0.5
      */
-    public ApnsClient(final X509Certificate certificate, final PrivateKey privateKey, final String privateKeyPassword, final NioEventLoopGroup eventLoopGroup) throws SSLException {
+    public ApnsClient(final X509Certificate certificate, final PrivateKey privateKey, final String privateKeyPassword, final EventLoopGroup eventLoopGroup) throws SSLException {
         this(ApnsClient.getSslContextWithCertificateAndPrivateKey(certificate, privateKey, privateKeyPassword), eventLoopGroup);
     }
 
@@ -353,7 +386,7 @@ public class ApnsClient<T extends ApnsPushNotification> {
                                 ApplicationProtocolNames.HTTP_2));
     }
 
-    protected ApnsClient(final SslContext sslContext, final NioEventLoopGroup eventLoopGroup) {
+    protected ApnsClient(final SslContext sslContext, final EventLoopGroup eventLoopGroup) {
         this.bootstrap = new Bootstrap();
 
         if (eventLoopGroup != null) {
@@ -364,7 +397,7 @@ public class ApnsClient<T extends ApnsPushNotification> {
             this.shouldShutDownEventLoopGroup = true;
         }
 
-        this.bootstrap.channel(NioSocketChannel.class);
+        this.bootstrap.channel(this.getSocketChannelClass(eventLoopGroup));
         this.bootstrap.option(ChannelOption.TCP_NODELAY, true);
         this.bootstrap.handler(new ChannelInitializer<SocketChannel>() {
 
@@ -376,6 +409,10 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
                 if (proxyHandlerFactory != null) {
                     pipeline.addFirst(proxyHandlerFactory.createProxyHandler());
+                }
+
+                if (ApnsClient.this.writeTimeoutMillis > 0) {
+                    pipeline.addLast(new WriteTimeoutHandler(ApnsClient.this.writeTimeoutMillis, TimeUnit.MILLISECONDS));
                 }
 
                 pipeline.addLast(sslContext.newHandler(channel.alloc()));
@@ -395,6 +432,7 @@ public class ApnsClient<T extends ApnsPushNotification> {
                                 }
                             }
 
+                            context.pipeline().addLast(new IdleStateHandler(0, 0, PING_IDLE_TIME));
                             context.pipeline().addLast(apnsClientHandler);
 
                             // Add this to the end of the queue so any events enqueued by the client handler happen
@@ -418,13 +456,13 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
                     @Override
                     protected void handshakeFailure(final ChannelHandlerContext context, final Throwable cause) throws Exception {
-                        super.handshakeFailure(context, cause);
-
                         final ChannelPromise connectionReadyPromise = ApnsClient.this.connectionReadyPromise;
 
                         if (connectionReadyPromise != null) {
                             connectionReadyPromise.tryFailure(cause);
                         }
+
+                        super.handshakeFailure(context, cause);
                     }
                 });
             }
@@ -432,15 +470,89 @@ public class ApnsClient<T extends ApnsPushNotification> {
     }
 
     /**
+     * Returns socket channel class suitable for specified event loop group.
+     *
+     * @param eventLoopGroup
+     * @return socket channel class
+     * @throws IllegalArgumentException in case of null or unrecognized event loop group.
+     */
+    private Class<? extends Channel> getSocketChannelClass(final EventLoopGroup eventLoopGroup) {
+        if (eventLoopGroup == null) {
+            log.warn("Asked for socket channel class to work with null event loop group, returning NioSocketChannel class.");
+            return NioSocketChannel.class;
+        }
+
+        if (eventLoopGroup instanceof NioEventLoopGroup) {
+            return NioSocketChannel.class;
+        } else if (eventLoopGroup instanceof OioEventLoopGroup) {
+            return OioSocketChannel.class;
+        }
+
+        // epoll?
+        final String className = eventLoopGroup.getClass().getName();
+        if (EPOLL_EVENT_LOOP_GROUP_CLASS.equals(className)) {
+            return this.loadSocketChannelClass(EPOLL_SOCKET_CHANNEL_CLASS);
+        }
+
+        throw new IllegalArgumentException(
+                "Don't know which socket channel class to return for event loop group " + className);
+    }
+
+    private Class<? extends Channel> loadSocketChannelClass(final String className) {
+        try {
+            final Class<?> clazz = Class.forName(className);
+            log.debug("Loaded socket channel class: {}", clazz);
+            return clazz.asSubclass(Channel.class);
+        } catch (final ClassNotFoundException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+    }
+
+    /**
      * Sets the maximum amount of time, in milliseconds, that a client will wait to establish a connection with the
      * APNs server before the connection attempt is considered a failure.
      *
      * @param timeoutMillis the maximum amount of time in milliseconds to wait for a connection attempt to complete
+     *
+     * @since 0.5
      */
     public void setConnectionTimeout(final int timeoutMillis) {
         synchronized (this.bootstrap) {
             this.bootstrap.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, timeoutMillis);
         }
+    }
+
+    /**
+     * Sets the metrics listener for this client.
+     *
+     * @param metricsListener the metrics listener for this client, or {@code null} if this client should not report
+     * metrics to a listener
+     *
+     * @since 0.6
+     */
+    public void setMetricsListener(final ApnsClientMetricsListener metricsListener) {
+        this.metricsListener = metricsListener != null ? metricsListener : new NoopMetricsListener();
+    }
+
+    /**
+     * <p>Sets the write timeout for this client. If an attempt to send a notification to the APNs server takes longer
+     * than the given timeout, the connection will be closed (and automatically reconnected later). Note that write
+     * timeouts refer to the amount of time taken to <em>send</em> a notification to the server, and not the time taken
+     * by the server to process and respond to a notification.</p>
+     *
+     * <p>Write timeouts should generally be set before starting a connection attempt. Changes to a client's write
+     * timeout will take effect after the next connection attempt; changes made to an already-connected client will have
+     * no immediate effect.</p>
+     *
+     * <p>By default, clients have a write timeout of {@value ApnsClient#DEFAULT_WRITE_TIMEOUT_MILLIS} milliseconds.</p>
+     *
+     * @param writeTimeoutMillis the write timeout for this client in milliseconds; if zero, write attempts will never
+     * time out
+     *
+     * @since 0.6
+     */
+    public void setWriteTimeout(final long writeTimeoutMillis) {
+        this.writeTimeoutMillis = writeTimeoutMillis;
     }
 
     /**
@@ -451,6 +563,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @param proxyHandlerFactory the proxy handler factory to be used to construct proxy handlers, or {@code null} if
      * this client should not use a proxy
+     *
+     * @since 0.6
      */
     public void setProxyHandlerFactory(final ProxyHandlerFactory proxyHandlerFactory) {
         this.proxyHandlerFactory = proxyHandlerFactory;
@@ -471,6 +585,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @see ApnsClient#PRODUCTION_APNS_HOST
      * @see ApnsClient#DEVELOPMENT_APNS_HOST
+     *
+     * @since 0.5
      */
     public Future<Void> connect(final String host) {
         return this.connect(host, DEFAULT_APNS_PORT);
@@ -494,6 +610,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * @see ApnsClient#DEVELOPMENT_APNS_HOST
      * @see ApnsClient#DEFAULT_APNS_PORT
      * @see ApnsClient#ALTERNATE_APNS_PORT
+     *
+     * @since 0.5
      */
     public Future<Void> connect(final String host, final int port) {
         final Future<Void> connectionReadyFuture;
@@ -506,6 +624,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
                 // We only want to begin a connection attempt if one is not already in progress or complete; if we already
                 // have a connection future, just return the existing promise.
                 if (this.connectionReadyPromise == null) {
+                    this.metricsListener.handleConnectionAttemptStarted(this);
+
                     final ChannelFuture connectFuture = this.bootstrap.connect(host, port);
                     this.connectionReadyPromise = connectFuture.channel().newPromise();
 
@@ -513,13 +633,15 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
                         @Override
                         public void operationComplete(final ChannelFuture future) throws Exception {
-                            // We always want to try to fail the "connection ready" promise if the connection closes; if
-                            // it has already succeeded, this will have no effect.
-                            ApnsClient.this.connectionReadyPromise.tryFailure(
-                                    new IllegalStateException("Channel closed before HTTP/2 preface completed."));
-
                             synchronized (ApnsClient.this.bootstrap) {
-                                ApnsClient.this.connectionReadyPromise = null;
+                                if (ApnsClient.this.connectionReadyPromise != null) {
+                                    // We always want to try to fail the "connection ready" promise if the connection
+                                    // closes; if it has already succeeded, this will have no effect.
+                                    ApnsClient.this.connectionReadyPromise.tryFailure(
+                                            new IllegalStateException("Channel closed before HTTP/2 preface completed."));
+
+                                    ApnsClient.this.connectionReadyPromise = null;
+                                }
 
                                 if (ApnsClient.this.reconnectionPromise != null) {
                                     log.debug("Disconnected. Next automatic reconnection attempt in {} seconds.", ApnsClient.this.reconnectDelay);
@@ -571,10 +693,15 @@ public class ApnsClient<T extends ApnsPushNotification> {
                                     ApnsClient.this.reconnectDelay = INITIAL_RECONNECT_DELAY;
                                     ApnsClient.this.reconnectionPromise = future.channel().newPromise();
                                 }
+
+                                ApnsClient.this.metricsListener.handleConnectionAttemptSucceeded(ApnsClient.this);
                             } else {
                                 log.info("Failed to connect.", future.cause());
+
+                                ApnsClient.this.metricsListener.handleConnectionAttemptFailed(ApnsClient.this);
                             }
-                        }});
+                        }
+                    });
                 }
 
                 connectionReadyFuture = this.connectionReadyPromise;
@@ -588,6 +715,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * Indicates whether this client is connected to the APNs gateway and ready to send push notifications.
      *
      * @return {@code true} if this client is connected and ready to send notifications or {@code false} otherwise
+     *
+     * @since 0.5
      */
     public boolean isConnected() {
         final ChannelPromise connectionReadyPromise = this.connectionReadyPromise;
@@ -605,6 +734,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * fail immediately with an {@link IllegalStateException}.</p>
      *
      * @return a {@code Future} that will succeed when the client has established a connection to the APNs gateway
+     *
+     * @since 0.5
      */
     public Future<Void> getReconnectionFuture() {
         final Future<Void> reconnectionFuture;
@@ -650,10 +781,12 @@ public class ApnsClient<T extends ApnsPushNotification> {
      *
      * @return a {@code Future} that will complete when the notification has been either accepted or rejected by the
      * APNs gateway
+     *
+     * @since 0.5
      */
     public Future<PushNotificationResponse<T>> sendNotification(final T notification) {
-
         final Future<PushNotificationResponse<T>> responseFuture;
+        final long notificationId = this.nextNotificationId.getAndIncrement();
 
         // Instead of synchronizing here, we keep a final reference to the connection ready promise. We can get away
         // with this because we're not changing the state of the connection or its promises. Keeping a reference ensures
@@ -670,9 +803,14 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
                 @Override
                 public void run() {
-                    // We want to do this inside the channel's event loop so we can be sure that only one thread is
-                    // modifying responsePromises.
-                    ApnsClient.this.responsePromises.put(notification, responsePromise);
+                    if (ApnsClient.this.responsePromises.containsKey(notification)) {
+                        responsePromise.setFailure(new IllegalStateException(
+                                "The given notification has already been sent and not yet resolved."));
+                    } else {
+                        // We want to do this inside the channel's event loop so we can be sure that only one thread is
+                        // modifying responsePromises.
+                        ApnsClient.this.responsePromises.put(notification, responsePromise);
+                    }
                 }
             });
 
@@ -680,13 +818,15 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
                 @Override
                 public void operationComplete(final ChannelFuture future) throws Exception {
-                    if (!future.isSuccess()) {
+                    if (future.isSuccess()) {
+                        ApnsClient.this.metricsListener.handleNotificationSent(ApnsClient.this, notificationId);
+                    } else {
                         log.debug("Failed to write push notification: {}", notification, future.cause());
 
                         // This will always be called from inside the channel's event loop, so we don't have to worry
                         // about synchronization.
                         ApnsClient.this.responsePromises.remove(notification);
-                        responsePromise.setFailure(future.cause());
+                        responsePromise.tryFailure(future.cause());
                     }
                 }
             });
@@ -697,6 +837,24 @@ public class ApnsClient<T extends ApnsPushNotification> {
             responseFuture = new FailedFuture<>(
                     GlobalEventExecutor.INSTANCE, NOT_CONNECTED_EXCEPTION);
         }
+
+        responseFuture.addListener(new GenericFutureListener<Future<PushNotificationResponse<T>>>() {
+
+            @Override
+            public void operationComplete(final Future<PushNotificationResponse<T>> future) throws Exception {
+                if (future.isSuccess()) {
+                    final PushNotificationResponse<T> response = future.getNow();
+
+                    if (response.isAccepted()) {
+                        ApnsClient.this.metricsListener.handleNotificationAccepted(ApnsClient.this, notificationId);
+                    } else {
+                        ApnsClient.this.metricsListener.handleNotificationRejected(ApnsClient.this, notificationId);
+                    }
+                } else {
+                    ApnsClient.this.metricsListener.handleWriteFailure(ApnsClient.this, notificationId);
+                }
+            }
+        });
 
         return responseFuture;
     }
@@ -717,6 +875,8 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * connection
      *
      * @see ApnsClient#disconnect()
+     *
+     * @since 0.5
      */
     public void setGracefulShutdownTimeout(final long timeoutMillis) {
         synchronized (this.bootstrap) {
@@ -724,8 +884,7 @@ public class ApnsClient<T extends ApnsPushNotification> {
 
             if (this.connectionReadyPromise != null) {
                 @SuppressWarnings("rawtypes")
-                final ApnsClientHandler handler =
-                this.connectionReadyPromise.channel().pipeline().get(ApnsClientHandler.class);
+                final ApnsClientHandler handler = this.connectionReadyPromise.channel().pipeline().get(ApnsClientHandler.class);
 
                 if (handler != null) {
                     handler.gracefulShutdownTimeoutMillis(timeoutMillis);
@@ -745,8 +904,10 @@ public class ApnsClient<T extends ApnsPushNotification> {
      * restarted after they have been disconnected via this method.</p>
      *
      * @return a {@code Future} that will be marked as complete when the connection has been closed
+     *
+     * @since 0.5
      */
-    @SuppressWarnings({ "unchecked", "rawtypes" })
+    @SuppressWarnings({ "rawtypes", "unchecked" })
     public Future<Void> disconnect() {
         log.info("Disconnecting.");
         final Future<Void> disconnectFuture;

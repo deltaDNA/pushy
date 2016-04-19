@@ -28,6 +28,9 @@ public class ExampleApp {
         final ApnsClient<SimpleApnsPushNotification> apnsClient = new ApnsClient<>(
                 new File("/path/to/certificate.p12"), "p12-file-password");
 
+        // Optional: we can listen for metrics by setting a metrics listener.
+        apnsClient.setMetricsListener(new NoopMetricsListener());
+
         // Optional: we can set a proxy handler factory if we must use a proxy.
         apnsClient.setProxyHandlerFactory(
                 new Socks5ProxyHandlerFactory(
@@ -63,19 +66,19 @@ public class ExampleApp {
                 apnsClient.sendNotification(pushNotification);
 
         try {
-            final PushNotificationResponse<SimpleApnsPushNotification> pushNotificationReponse =
+            final PushNotificationResponse<SimpleApnsPushNotification> pushNotificationResponse =
                     sendNotificationFuture.get();
 
-            if (pushNotificationReponse.isAccepted()) {
+            if (pushNotificationResponse.isAccepted()) {
                 // Everything worked! The notification was successfully sent to
                 // and accepted by the gateway.
             } else {
                 // Something went wrong; this should be considered a permanent
                 // failure, and we shouldn't try to send the notification again.
                 System.out.println("Notification rejected by the APNs gateway: " +
-                        pushNotificationReponse.getRejectionReason());
+                        pushNotificationResponse.getRejectionReason());
 
-                if (pushNotificationReponse.getTokenInvalidationTimestamp() != null) {
+                if (pushNotificationResponse.getTokenInvalidationTimestamp() != null) {
                     // If we have an invalidation timestamp, we should also stop
                     // trying to send notifications to the destination token (unless
                     // it's been renewed somehow since the expiration timestamp).
